@@ -241,7 +241,6 @@ object SyncEngine {
             return Result(0.0, "منخفضة")
         }
 
-        // Resample both to 100 Hz (10 ms grid) using nearest timestamp.
         val startNano = minOf(radioEnvelope.first().first, micEnvelope.first().first)
         val radioResampled = resample(radioEnvelope, startNano)
         val micResampled = resample(micEnvelope, startNano)
@@ -249,7 +248,6 @@ object SyncEngine {
         val maxLag = (maxDelaySec * 100).toInt().coerceAtMost(radioResampled.size - 5)
         if (maxLag <= 0) return Result(0.0, "منخفضة")
 
-        // Normalised cross‑correlation
         var bestLag = 0
         var bestCorr = -2.0
         for (lag in 0..maxLag) {
@@ -315,7 +313,6 @@ object SyncEngine {
 @OptIn(UnstableApi::class)
 class MainActivity : AppCompatActivity() {
 
-    // UI
     private lateinit var statusText: TextView
     private lateinit var delayReadout: TextView
     private lateinit var confidenceBadge: TextView
@@ -330,12 +327,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var delaySlider: SeekBar
     private lateinit var durationGroup: RadioGroup
 
-    // Player
     private var player: ExoPlayer? = null
     private var audioProcessor: DelayAudioProcessor? = null
     private var relayServer: LocalRelayServer? = null
 
-    // State
     private var isPlaying = false
     private var isMeasuring = false
     private var measuredDelay: Double? = null
@@ -366,9 +361,6 @@ class MainActivity : AppCompatActivity() {
         window.decorView.layoutDirection = View.LAYOUT_DIRECTION_RTL
     }
 
-    // -----------------------------------------------------------------------
-    // UI construction (programmatic, no XML)
-    // -----------------------------------------------------------------------
     private fun buildUI() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -380,7 +372,6 @@ class MainActivity : AppCompatActivity() {
         val scroll = ScrollView(this)
         scroll.addView(root, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
 
-        // 1. Status card
         val statusCard = card()
         statusText = TextView(this).apply {
             text = "لم يتم الاتصال بعد"
@@ -404,7 +395,6 @@ class MainActivity : AppCompatActivity() {
         statusCard.addView(confidenceBadge)
         root.addView(statusCard)
 
-        // 2. Stream bar
         val streamCard = card()
         urlInput = EditText(this).apply {
             hint = "أدخل رابط البث"
@@ -425,7 +415,6 @@ class MainActivity : AppCompatActivity() {
         streamCard.addView(streamRow)
         root.addView(streamCard)
 
-        // 3. Measure card
         val measureCard = card()
         measureButton = emeraldButton("فحص التأخير") { requestMeasurement() }
         measureCard.addView(measureButton)
@@ -460,7 +449,6 @@ class MainActivity : AppCompatActivity() {
         measureCard.addView(countdownBar)
         root.addView(measureCard)
 
-        // 4. Action row
         val actionRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -474,7 +462,6 @@ class MainActivity : AppCompatActivity() {
         actionRow.addView(resetButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         root.addView(actionRow)
 
-        // 5. Manual fine‑tuning card
         val manualCard = card()
         val manualTitle = TextView(this).apply {
             text = "ضبط يدوي"
@@ -493,7 +480,7 @@ class MainActivity : AppCompatActivity() {
         manualCard.addView(manualDelayReadout)
 
         delaySlider = SeekBar(this).apply {
-            max = 12000 // 0..120.00 in steps of 0.01
+            max = 12000
             progress = 0
             progressTintList = android.content.res.ColorStateList.valueOf(Color.parseColor("#10B981"))
             thumbTintList = android.content.res.ColorStateList.valueOf(Color.parseColor("#10B981"))
@@ -540,9 +527,6 @@ class MainActivity : AppCompatActivity() {
         setContentView(scroll)
     }
 
-    // -----------------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------------
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     private fun card(): LinearLayout {
@@ -584,9 +568,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Preferences
-    // -----------------------------------------------------------------------
     private fun restorePrefs() {
         val lastUrl = prefs.getString("last_url", "http://foxfm.xyz:8080/live1") ?: "http://foxfm.xyz:8080/live1"
         urlInput.setText(lastUrl)
@@ -596,9 +577,6 @@ class MainActivity : AppCompatActivity() {
         prefs.edit().putString("last_url", url).apply()
     }
 
-    // -----------------------------------------------------------------------
-    // Playback
-    // -----------------------------------------------------------------------
     private fun togglePlay() {
         if (isPlaying) stopPlayback() else startPlayback()
     }
@@ -616,13 +594,11 @@ class MainActivity : AppCompatActivity() {
         if (isHls) {
             playbackUrl = url
         } else {
-            // Start local relay
             relayServer = LocalRelayServer(url)
             val port = relayServer!!.start()
             playbackUrl = "http://127.0.0.1:$port/stream"
         }
 
-        // Fix: We assign it to a local non-null variable to avoid Type Mismatch
         val proc = DelayAudioProcessor(44100, 2)
         audioProcessor = proc
 
@@ -634,9 +610,8 @@ class MainActivity : AppCompatActivity() {
             ): AudioSink {
                 return DefaultAudioSink.Builder(context)
                     .setAudioProcessorChain(
-                        DefaultAudioSink.DefaultAudioProcessorChain(
-                            arrayOf<androidx.media3.common.audio.AudioProcessor>(proc)
-                        )
+                        // الإصلاح هنا: تمرير المتغير مباشرة بدلاً من arrayOf
+                        DefaultAudioSink.DefaultAudioProcessorChain(proc)
                     )
                     .setEnableFloatOutput(enableFloatOutput)
                     .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
@@ -692,9 +667,6 @@ class MainActivity : AppCompatActivity() {
         updateStatus("تم إيقاف البث")
     }
 
-    // -----------------------------------------------------------------------
-    // Mute / Reset
-    // -----------------------------------------------------------------------
     private fun toggleMute() {
         val proc = audioProcessor ?: return
         proc.isMuted = !proc.isMuted
@@ -711,9 +683,6 @@ class MainActivity : AppCompatActivity() {
         updateStatus("تمت إعادة التأخير إلى 0.00 ث")
     }
 
-    // -----------------------------------------------------------------------
-    // Measurement
-    // -----------------------------------------------------------------------
     private fun requestMeasurement() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
@@ -737,12 +706,11 @@ class MainActivity : AppCompatActivity() {
         countdownBar.progress = 0
 
         val wasMuted = proc.isMuted
-        proc.isMuted = true // mute during measurement
+        proc.isMuted = true
 
         val radioEnvelope = mutableListOf<Pair<Long, Float>>()
         val micEnvelope = mutableListOf<Pair<Long, Float>>()
 
-        // Start AudioRecord (16 kHz mono PCM)
         val sampleRate = 16000
         val channelConfig = AudioFormat.CHANNEL_IN_MONO
         val audioFormat = AudioFormat.ENCODING_PCM_16BIT
@@ -768,7 +736,7 @@ class MainActivity : AppCompatActivity() {
         val scope = CoroutineScope(Dispatchers.IO)
         scope.launch {
             recorder.startRecording()
-            val buffer = ShortArray(1600) // 100 ms at 16 kHz
+            val buffer = ShortArray(1600)
             val startNano = System.nanoTime()
             var elapsedMs = 0L
             val totalMs = selectedDurationSec * 1000L
@@ -790,7 +758,6 @@ class MainActivity : AppCompatActivity() {
             recorder.stop()
             recorder.release()
 
-            // Collect radio envelope accumulated during the same window
             radioEnvelope.addAll(proc.pollEnvelope())
 
             withContext(Dispatchers.Main) {
@@ -839,7 +806,6 @@ class MainActivity : AppCompatActivity() {
         updateStatus("تمت المزامنة عند تأخير %.2f ث".format(d))
     }
 
-    // -----------------------------------------------------------------------
     override fun onDestroy() {
         super.onDestroy()
         player?.release()
