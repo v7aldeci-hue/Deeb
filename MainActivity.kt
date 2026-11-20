@@ -47,7 +47,6 @@ import java.net.*
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.*
 import kotlin.random.Random
@@ -623,7 +622,10 @@ class MainActivity : AppCompatActivity() {
             playbackUrl = "http://127.0.0.1:$port/stream"
         }
 
-        audioProcessor = DelayAudioProcessor(44100, 2) // common for MP3/AAC; will be reconfigured
+        // Fix: We assign it to a local non-null variable to avoid Type Mismatch
+        val proc = DelayAudioProcessor(44100, 2)
+        audioProcessor = proc
+
         val renderersFactory = object : DefaultRenderersFactory(this) {
             override fun buildAudioSink(
                 context: Context,
@@ -633,7 +635,7 @@ class MainActivity : AppCompatActivity() {
                 return DefaultAudioSink.Builder(context)
                     .setAudioProcessorChain(
                         DefaultAudioSink.DefaultAudioProcessorChain(
-                            arrayOf(audioProcessor)
+                            arrayOf<androidx.media3.common.audio.AudioProcessor>(proc)
                         )
                     )
                     .setEnableFloatOutput(enableFloatOutput)
