@@ -33,6 +33,7 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.audio.BaseAudioProcessor
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
@@ -55,29 +56,20 @@ import kotlin.random.Random
 // 1. Delay Audio Processor (BaseAudioProcessor)
 // ---------------------------------------------------------------------------
 @OptIn(UnstableApi::class)
-class DelayAudioProcessor(
-    private val sampleRate: Int,
-    private val channelCount: Int
-) : BaseAudioProcessor() {
-
-    // 125 seconds of 16‑bit PCM
-    private val maxBufferSamples = 125 * sampleRate * channelCount
-    private val ringBuffer = ShortArray(maxBufferSamples)
+class DelayAudioProcessor : BaseAudioProcessor() {
+    private var ringBuffer: ShortArray = ShortArray(0)
     private val writeIndex = AtomicInteger(0)
-    private val readIndex = AtomicInteger(0)
+    private var sampleRate = 44100
+    private var channelCount = 2
 
     @Volatile var delaySeconds: Double = 0.0
         set(value) {
             field = value.coerceIn(0.0, 120.0)
-            val samples = (field * sampleRate * channelCount).toInt()
-            readIndex.set((writeIndex.get() - samples + maxBufferSamples) % maxBufferSamples)
         }
 
     @Volatile var isMuted: Boolean = false
 
-    // Envelope: one value every 10 ms (RMS of the block)
-    private val envelopeIntervalMs = 10
-    private val envelopeQueue = ConcurrentLinkedQueue<Pair<Long, Float>>() // (nanoTime, rms)
+    private val envelopeQueue = ConcurrentLinkedQueue<Pair<Long, Float>>()
 
     fun pollEnvelope(): List<Pair<Long, Float>> {
         val list = mutableListOf<Pair<Long, Float>>()
@@ -88,19 +80,21 @@ class DelayAudioProcessor(
         return list
     }
 
-    override fun onConfigure(inputAudioFormat: androidx.media3.common.audio.AudioProcessor.AudioFormat): androidx.media3.common.audio.AudioProcessor.AudioFormat {
-        return androidx.media3.common.audio.AudioProcessor.AudioFormat(
-            sampleRate,
-            channelCount,
-            C.ENCODING_PCM_16BIT
-        )
+    override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
+        if (inputAudioFormat.sampleRate != sampleRate || inputAudioFormat.channelCount != channelCount) {
+            sampleRate = inputAudioFormat.sampleRate
+            channelCount = inputAudioFormat.channelCount
+            val maxBufferSamples = 125 * sampleRate * channelCount
+            ringBuffer = ShortArray(maxBufferSamples)
+            writeIndex.set(0)
+        }
+        return AudioProcessor.AudioFormat(sampleRate, channelCount, C.ENCODING_PCM_16BIT)
     }
 
     override fun queueInput(inputBuffer: ByteBuffer) {
         val remaining = inputBuffer.remaining()
         if (remaining <= 0) return
 
-        // Convert float input to 16‑bit if needed
         val isFloat = inputAudioFormat.encoding == C.ENCODING_PCM_FLOAT
         val inputSamples: ShortArray
         if (isFloat) {
@@ -108,8 +102,7 @@ class DelayAudioProcessor(
             val floatCount = floatBuffer.remaining()
             inputSamples = ShortArray(floatCount)
             for (i in 0 until floatCount) {
-                val f = floatBuffer.get()
-                inputSamples[i] = (f.coerceIn(-1f, 1f) * 32767f).toInt().toShort()
+                inputSamples[i] = (floatBuffer.get().coerceIn(-1f, 1f) * 32767f).toInt().toShort()
             }
         } else {
             val shortBuffer = inputBuffer.order(ByteOrder.nativeOrder()).asShortBuffer()
@@ -118,33 +111,35 @@ class DelayAudioProcessor(
         }
         inputBuffer.position(inputBuffer.limit())
 
-        // Write to ring buffer
+        // حساب مغلف الصوت (Envelope) للقياس
+        if (inputSamples.isNotEmpty()) {
+            var sum = 0.0
+            for (s in inputSamples) sum += s.toDouble() * s
+            envelopeQueue.add(System.nanoTime() to sqrt(sum / inputSamples.size).toFloat())
+        }
+
+        val maxBufferSamples = ringBuffer.size
+        if (maxBufferSamples == 0) return
+
         val writePos = writeIndex.get()
         for (i in inputSamples.indices) {
             ringBuffer[(writePos + i) % maxBufferSamples] = inputSamples[i]
         }
         writeIndex.set((writePos + inputSamples.size) % maxBufferSamples)
 
-        // Envelope (RMS) – one value per block, tagged with nanoTime
-        if (inputSamples.isNotEmpty()) {
-            var sum = 0.0
-            for (s in inputSamples) sum += s.toDouble() * s
-            val rms = sqrt(sum / inputSamples.size).toFloat()
-            envelopeQueue.add(System.nanoTime() to rms)
-        }
+        val samplesToDelay = (delaySeconds * sampleRate * channelCount).toInt()
+        var readPos = (writePos - samplesToDelay) % maxBufferSamples
+        if (readPos < 0) readPos += maxBufferSamples
 
-        // Determine output size (same as input)
-        val outputBuffer = replaceOutputBuffer(inputSamples.size * 2) // 16‑bit = 2 bytes
+        val outputBuffer = replaceOutputBuffer(inputSamples.size * 2)
         val outShort = outputBuffer.order(ByteOrder.nativeOrder()).asShortBuffer()
 
         if (isMuted) {
             for (i in 0 until inputSamples.size) outShort.put(0)
         } else {
-            val readPos = readIndex.get()
             for (i in 0 until inputSamples.size) {
                 outShort.put(ringBuffer[(readPos + i) % maxBufferSamples])
             }
-            readIndex.set((readPos + inputSamples.size) % maxBufferSamples)
         }
         outputBuffer.position(0)
         outputBuffer.limit(inputSamples.size * 2)
@@ -152,12 +147,11 @@ class DelayAudioProcessor(
 
     override fun onFlush() {
         envelopeQueue.clear()
+        writeIndex.set(0)
     }
 
     override fun onReset() {
-        writeIndex.set(0)
-        readIndex.set(0)
-        envelopeQueue.clear()
+        onFlush()
         delaySeconds = 0.0
         isMuted = false
     }
@@ -205,7 +199,6 @@ class LocalRelayServer(private val remoteUrl: String) {
             val input = remote.inputStream
             val output = client.getOutputStream()
 
-            // Send a clean HTTP/1.1 200 OK to ExoPlayer (converts ICY if needed)
             val header = "HTTP/1.1 200 OK\r\n" +
                     "Content-Type: audio/mpeg\r\n" +
                     "Connection: close\r\n\r\n"
@@ -227,83 +220,100 @@ class LocalRelayServer(private val remoteUrl: String) {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Sync Engine (normalised cross‑correlation on envelopes)
+// 3. Sync Engine (Strict validation & direction detection)
 // ---------------------------------------------------------------------------
 object SyncEngine {
-    data class Result(val delaySeconds: Double, val confidenceLabel: String)
+    data class Result(
+        val delaySeconds: Double, // >0 تعني أن الراديو متقدم. <0 تعني أن التلفاز متقدم.
+        val isSuccess: Boolean,
+        val message: String
+    )
 
-    fun computeDelay(
-        radioEnvelope: List<Pair<Long, Float>>,
-        micEnvelope: List<Pair<Long, Float>>,
-        maxDelaySec: Double = 120.0
-    ): Result {
-        if (radioEnvelope.size < 5 || micEnvelope.size < 5) {
-            return Result(0.0, "منخفضة")
+    fun computeDelay(radio: List<Pair<Long, Float>>, mic: List<Pair<Long, Float>>): Result {
+        if (radio.size < 10 || mic.size < 10) return Result(0.0, false, "لم يتم جمع بيانات كافية.")
+
+        // 1. فحص الصمت (هل سمعنا التلفاز؟)
+        val micRms = mic.map { it.second }.average()
+        if (micRms < 250.0) {
+            return Result(0.0, false, "لم يتم سماع صوت التلفاز. يرجى التأكد من رفع صوت التلفاز والمحاولة مرة أخرى.")
+        }
+        val radioRms = radio.map { it.second }.average()
+        if (radioRms < 150.0) {
+            return Result(0.0, false, "صوت البث الصوتي خافت جداً أو لا يعمل. تحقق من الرابط.")
         }
 
-        val startNano = minOf(radioEnvelope.first().first, micEnvelope.first().first)
-        val radioResampled = resample(radioEnvelope, startNano)
-        val micResampled = resample(micEnvelope, startNano)
+        // 2. توحيد المقاسات لمقارنة دقيقة (شبكة 10 مللي ثانية)
+        val startTime = min(radio.first().first, mic.first().first)
+        val endTime = max(radio.last().first, mic.last().first)
+        val size = ((endTime - startTime) / 10_000_000L).toInt() + 1
+        val rArr = FloatArray(size)
+        val mArr = FloatArray(size)
 
-        val maxLag = (maxDelaySec * 100).toInt().coerceAtMost(radioResampled.size - 5)
-        if (maxLag <= 0) return Result(0.0, "منخفضة")
+        for ((ts, rms) in radio) {
+            val idx = ((ts - startTime) / 10_000_000L).toInt()
+            if (idx in rArr.indices) rArr[idx] = rms
+        }
+        for ((ts, rms) in mic) {
+            val idx = ((ts - startTime) / 10_000_000L).toInt()
+            if (idx in mArr.indices) mArr[idx] = rms
+        }
 
-        var bestLag = 0
+        val micStartIdx = ((mic.first().first - startTime) / 10_000_000L).toInt()
+        val micEndIdx = ((mic.last().first - startTime) / 10_000_000L).toInt()
+
+        var bestLagIdx = 0
         var bestCorr = -2.0
-        for (lag in 0..maxLag) {
-            val corr = normalizedCorrelation(radioResampled, micResampled, lag)
-            if (corr > bestCorr) {
-                bestCorr = corr
-                bestLag = lag
+
+        // البحث من -30 ثانية (التلفاز متقدم) إلى +120 ثانية (الراديو متقدم)
+        val minLag = -3000
+        val maxLag = 12000
+
+        for (lag in minLag..maxLag) {
+            val start = max(micStartIdx, lag)
+            val end = min(micEndIdx, rArr.size + lag)
+
+            if (start < end) {
+                val mSeg = mArr.copyOfRange(start, end)
+                val rSeg = rArr.copyOfRange(start - lag, end - lag)
+                val corr = correlate(mSeg, rSeg)
+                if (corr > bestCorr) {
+                    bestCorr = corr
+                    bestLagIdx = lag
+                }
             }
         }
 
-        val delaySec = bestLag / 100.0
-        val confidence = when {
-            bestCorr > 0.6 -> "عالية"
-            bestCorr > 0.35 -> "متوسطة"
-            else -> "منخفضة"
+        // 3. رفض التخمين (إذا كان التطابق ضعيفاً)
+        if (bestCorr < 0.25) {
+            return Result(0.0, false, "لم نتمكن من اكتشاف تطابق بين البث والتلفاز. تأكد من أن المعلق يتحدث عن نفس اللعبة، أو أعد المحاولة.")
         }
-        return Result(delaySec, confidence)
+
+        val delaySeconds = bestLagIdx / 100.0
+        val confidence = if (bestCorr > 0.5) "عالية" else "متوسطة"
+
+        return if (delaySeconds > 0) {
+            Result(delaySeconds, true, "الراديو متقدم بـ %.2f ثانية. (الثقة: %s)".format(delaySeconds, confidence))
+        } else if (delaySeconds < 0) {
+            Result(delaySeconds, true, "التلفاز متقدم بـ %.2f ثانية. (الثقة: %s)".format(abs(delaySeconds), confidence))
+        } else {
+            Result(0.0, true, "الراديو والتلفاز متزامنان تماماً. (الثقة: %s)".format(confidence))
+        }
     }
 
-    private fun resample(
-        envelope: List<Pair<Long, Float>>,
-        startNano: Long,
-        targetHz: Int = 100
-    ): FloatArray {
-        if (envelope.isEmpty()) return FloatArray(0)
-        val durationSec = (envelope.last().first - startNano) / 1_000_000_000.0
-        val size = (durationSec * targetHz).toInt().coerceAtLeast(1)
-        val result = FloatArray(size)
-        var idx = 0
-        var nextTargetTime = startNano
-        for ((ts, rms) in envelope) {
-            while (idx < size && ts >= nextTargetTime) {
-                result[idx] = rms
-                idx++
-                nextTargetTime += 1_000_000_000L / targetHz
-            }
-            if (idx >= size) break
+    private fun correlate(m: FloatArray, r: FloatArray): Double {
+        if (m.isEmpty() || r.isEmpty() || m.size != r.size) return -2.0
+        var sumM = 0.0; var sumR = 0.0; var sumMR = 0.0
+        var sumM2 = 0.0; var sumR2 = 0.0
+        for (i in m.indices) {
+            val mv = m[i].toDouble(); val rv = r[i].toDouble()
+            sumM += mv; sumR += rv
+            sumMR += mv * rv
+            sumM2 += mv * mv; sumR2 += rv * rv
         }
-        return result
-    }
-
-    private fun normalizedCorrelation(a: FloatArray, b: FloatArray, lag: Int): Double {
-        val n = minOf(a.size, b.size - lag)
-        if (n < 5) return -2.0
-        var sumA = 0.0; var sumB = 0.0; var sumAB = 0.0
-        var sumA2 = 0.0; var sumB2 = 0.0
-        for (i in 0 until n) {
-            val va = a[i].toDouble()
-            val vb = b[i + lag].toDouble()
-            sumA += va; sumB += vb
-            sumAB += va * vb
-            sumA2 += va * va; sumB2 += vb * vb
-        }
-        val numerator = n * sumAB - sumA * sumB
-        val denom = sqrt((n * sumA2 - sumA * sumA) * (n * sumB2 - sumB * sumB))
-        return if (denom == 0.0) -2.0 else numerator / denom
+        val n = m.size
+        val num = n * sumMR - sumM * sumR
+        val den = sqrt((n * sumM2 - sumM * sumM) * (n * sumR2 - sumR * sumR))
+        return if (den == 0.0) -2.0 else num / den
     }
 }
 
@@ -334,11 +344,11 @@ class MainActivity : AppCompatActivity() {
     private var isPlaying = false
     private var isMeasuring = false
     private var measuredDelay: Double? = null
-    private var measuredConfidence: String? = null
     private var selectedDurationSec = 20
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val prefs by lazy { getSharedPreferences("radio_sync", Context.MODE_PRIVATE) }
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     private val recordPermissionLauncher =
         registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.RequestPermission()) { granted ->
@@ -558,8 +568,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun updateStatus(msg: String) {
-        mainHandler.post { statusText.text = msg }
+    private fun updateStatus(msg: String, isError: Boolean = false) {
+        mainHandler.post { 
+            statusText.text = msg 
+            statusText.setTextColor(if (isError) Color.parseColor("#EF4444") else Color.WHITE)
+        }
     }
 
     private fun updateDelayReadout(tvDelay: Double, radioDelay: Double) {
@@ -584,7 +597,7 @@ class MainActivity : AppCompatActivity() {
     private fun startPlayback() {
         val url = urlInput.text.toString().trim()
         if (url.isEmpty()) {
-            updateStatus("الرجاء إدخال رابط البث")
+            updateStatus("الرجاء إدخال رابط البث", true)
             return
         }
         saveLastUrl(url)
@@ -599,7 +612,7 @@ class MainActivity : AppCompatActivity() {
             playbackUrl = "http://127.0.0.1:$port/stream"
         }
 
-        val proc = DelayAudioProcessor(44100, 2)
+        val proc = DelayAudioProcessor()
         audioProcessor = proc
 
         val renderersFactory = object : DefaultRenderersFactory(this) {
@@ -610,7 +623,6 @@ class MainActivity : AppCompatActivity() {
             ): AudioSink {
                 return DefaultAudioSink.Builder(context)
                     .setAudioProcessorChain(
-                        // الإصلاح هنا: تمرير المتغير مباشرة بدلاً من arrayOf
                         DefaultAudioSink.DefaultAudioProcessorChain(proc)
                     )
                     .setEnableFloatOutput(enableFloatOutput)
@@ -637,7 +649,7 @@ class MainActivity : AppCompatActivity() {
                 )
                 addListener(object : Player.Listener {
                     override fun onPlayerError(error: PlaybackException) {
-                        updateStatus("خطأ في البث: ${error.errorCodeName} – ${error.message}")
+                        updateStatus("خطأ في البث: ${error.errorCodeName} – ${error.message}", true)
                     }
 
                     override fun onPlaybackStateChanged(playbackState: Int) {
@@ -678,8 +690,8 @@ class MainActivity : AppCompatActivity() {
         delaySlider.progress = 0
         manualDelayReadout.text = "0.00 ث"
         measuredDelay = null
-        measuredConfidence = null
         confidenceBadge.visibility = View.GONE
+        updateDelayReadout(0.0, 0.0)
         updateStatus("تمت إعادة التأخير إلى 0.00 ث")
     }
 
@@ -696,7 +708,7 @@ class MainActivity : AppCompatActivity() {
     private fun startMeasurement() {
         if (isMeasuring) return
         val proc = audioProcessor ?: run {
-            updateStatus("يجب تشغيل البث أولاً")
+            updateStatus("يجب تشغيل البث أولاً", true)
             return
         }
 
@@ -704,9 +716,11 @@ class MainActivity : AppCompatActivity() {
         measureButton.isEnabled = false
         countdownBar.visibility = View.VISIBLE
         countdownBar.progress = 0
+        updateStatus("جاري القياس... يرجى إبقاء صوت التلفاز مرتفعاً")
+        confidenceBadge.visibility = View.GONE
 
         val wasMuted = proc.isMuted
-        proc.isMuted = true
+        proc.isMuted = true 
 
         val radioEnvelope = mutableListOf<Pair<Long, Float>>()
         val micEnvelope = mutableListOf<Pair<Long, Float>>()
@@ -728,63 +742,68 @@ class MainActivity : AppCompatActivity() {
             minBuf * 4
         )
         if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-            updateStatus("تعذر تهيئة الميكروفون")
+            updateStatus("تعذر تهيئة الميكروفون", true)
             isMeasuring = false
             return
         }
 
-        val scope = CoroutineScope(Dispatchers.IO)
         scope.launch {
-            recorder.startRecording()
-            val buffer = ShortArray(1600)
-            val startNano = System.nanoTime()
-            var elapsedMs = 0L
-            val totalMs = selectedDurationSec * 1000L
+            withContext(Dispatchers.IO) {
+                recorder.startRecording()
+                val buffer = ShortArray(1600)
+                val startNano = System.nanoTime()
+                var elapsedMs = 0L
+                val totalMs = selectedDurationSec * 1000L
 
-            while (elapsedMs < totalMs && isActive) {
-                val read = recorder.read(buffer, 0, buffer.size)
-                if (read > 0) {
-                    var sum = 0.0
-                    for (i in 0 until read) sum += buffer[i].toDouble() * buffer[i]
-                    val rms = sqrt(sum / read).toFloat()
-                    micEnvelope.add(System.nanoTime() to rms)
+                while (elapsedMs < totalMs && isActive) {
+                    val read = recorder.read(buffer, 0, buffer.size)
+                    if (read > 0) {
+                        var sum = 0.0
+                        for (i in 0 until read) sum += buffer[i].toDouble() * buffer[i]
+                        val rms = sqrt(sum / read).toFloat()
+                        micEnvelope.add(System.nanoTime() to rms)
+                    }
+                    elapsedMs = (System.nanoTime() - startNano) / 1_000_000
+                    withContext(Dispatchers.Main) {
+                        countdownBar.progress = (elapsedMs * 100 / totalMs).toInt()
+                    }
                 }
-                elapsedMs = (System.nanoTime() - startNano) / 1_000_000
-                withContext(Dispatchers.Main) {
-                    countdownBar.progress = (elapsedMs * 100 / totalMs).toInt()
-                }
+
+                recorder.stop()
+                recorder.release()
             }
 
-            recorder.stop()
-            recorder.release()
+            countdownBar.visibility = View.GONE
+            measureButton.isEnabled = true
+            isMeasuring = false
+            proc.isMuted = wasMuted
 
             radioEnvelope.addAll(proc.pollEnvelope())
 
-            withContext(Dispatchers.Main) {
-                countdownBar.visibility = View.GONE
-                measureButton.isEnabled = true
-                isMeasuring = false
-                proc.isMuted = wasMuted
+            updateStatus("جاري حساب التأخير...")
+            
+            val result = withContext(Dispatchers.Default) {
+                SyncEngine.computeDelay(radioEnvelope, micEnvelope)
+            }
 
-                if (radioEnvelope.size < 10 || micEnvelope.size < 10) {
-                    updateStatus("لم يتم جمع بيانات كافية للقياس")
-                    return@withContext
-                }
-
-                val result = SyncEngine.computeDelay(radioEnvelope, micEnvelope, 120.0)
+            if (!result.isSuccess) {
+                // فشل الفحص أو لم يتم سماع صوت
+                updateStatus(result.message, true)
+                confidenceBadge.visibility = View.GONE
+                measuredDelay = null
+            } else {
+                // نجاح الفحص
                 measuredDelay = result.delaySeconds
-                measuredConfidence = result.confidenceLabel
-
+                updateStatus(result.message, false)
                 confidenceBadge.visibility = View.VISIBLE
-                confidenceBadge.text = "الثقة: ${result.confidenceLabel}"
+                
+                val confText = if (result.message.contains("عالية")) "عالية" else "متوسطة"
+                confidenceBadge.text = "الثقة: $confText"
 
-                if (result.delaySeconds > 0.05) {
+                if (result.delaySeconds > 0) {
                     updateDelayReadout(0.0, result.delaySeconds)
-                    updateStatus("تم اكتشاف تأخير %.2f ث (الثقة: %s). اضغط «زامن الآن» للتطبيق.".format(
-                        result.delaySeconds, result.confidenceLabel))
                 } else {
-                    updateDelayReadout(0.0, 0.0)
-                    updateStatus("الراديو متأخر أو متزامن بالفعل مع الصورة. لا يمكن تقديم الصوت.")
+                    updateDelayReadout(abs(result.delaySeconds), 0.0)
                 }
             }
         }
@@ -792,22 +811,27 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyMeasuredDelay() {
         val d = measuredDelay ?: run {
-            updateStatus("قم بإجراء فحص التأخير أولاً")
+            updateStatus("قم بإجراء فحص التأخير أولاً", true)
             return
         }
-        if (d <= 0.05) {
-            updateStatus("لا يوجد تأخير موجب لتطبيقه (الراديو ليس متقدماً على الصورة)")
-            return
+
+        if (d > 0.05) {
+            audioProcessor?.delaySeconds = d
+            delaySlider.progress = (d * 100).toInt()
+            manualDelayReadout.text = String.format("%.2f ث", d)
+            updateDelayReadout(0.0, d)
+            updateStatus("تم تأخير الصوت بـ %.2f ثانية بنجاح.".format(d))
+        } else if (d < -0.05) {
+            updateStatus("التلفاز متقدم بـ %.2f ثانية. لا يمكن تقديم الراديو المباشر.".format(abs(d)), true)
+            resetDelay()
+        } else {
+            updateStatus("الصوت والصورة متزامنان بالفعل.")
         }
-        audioProcessor?.delaySeconds = d
-        delaySlider.progress = (d * 100).toInt()
-        manualDelayReadout.text = String.format("%.2f ث", d)
-        updateDelayReadout(0.0, d)
-        updateStatus("تمت المزامنة عند تأخير %.2f ث".format(d))
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        scope.cancel()
         player?.release()
         relayServer?.stop()
     }
