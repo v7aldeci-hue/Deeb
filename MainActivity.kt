@@ -12,7 +12,6 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.*
@@ -51,7 +50,37 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.*
 
 // ---------------------------------------------------------------------------
-// 1. Delay Audio Processor (مع خاصية Crossfade لتفادي القرقعة)
+// 0. كائنات البيانات (إذاعات FoX FM)
+// ---------------------------------------------------------------------------
+data class RadioStation(val name: String, val url: String)
+
+val foxFmStations = listOf(
+    RadioStation("FoX FM Live 1", "http://foxfm.xyz:8080/live1"),
+    RadioStation("FoX FM Live 2", "http://foxfm.xyz:8080/live2"),
+    RadioStation("FoX FM Live 3", "http://foxfm.xyz:8080/live3"),
+    RadioStation("FoX FM Live 4", "http://foxfm.xyz:8080/live4"),
+    RadioStation("FoX FM 1", "http://foxfm.xyz/1"),
+    RadioStation("FoX FM 2", "http://foxfm.xyz/2"),
+    RadioStation("FoX FM 3", "http://foxfm.xyz/3"),
+    RadioStation("FoX FM 4", "http://foxfm.xyz/4"),
+    RadioStation("FoX FM 5", "http://foxfm.xyz/5"),
+    RadioStation("FoX FM Xtra 1", "http://foxfm.xyz:8080/xtra1"),
+    RadioStation("FoX FM Xtra 2", "http://foxfm.xyz:8080/xtra2"),
+    RadioStation("FoX FM EN 1", "http://foxfm.xyz:8080/en1"),
+    RadioStation("FoX FM EN 2", "http://foxfm.xyz:8080/en2"),
+    RadioStation("FoX FM FR 1", "http://foxfm.xyz:8080/fr1"),
+    RadioStation("FoX FM StarzPlay 1", "http://foxfm.xyz:8080/starzplay1"),
+    RadioStation("FoX FM Shasha 1", "http://foxfm.xyz:8080/shasha1"),
+    RadioStation("FoX FM Thmanyah 1", "http://foxfm.xyz:8080/thmanyah1"),
+    RadioStation("FoX FM Shahid 1", "http://foxfm.xyz:8080/shahid1"),
+    RadioStation("FoX FM Alkass 5", "http://foxfm.xyz:8080/alkass5"),
+    RadioStation("FoX FM Alkass 6", "http://foxfm.xyz:8080/alkass6"),
+    RadioStation("FoX FM Alkass 7", "http://foxfm.xyz:8080/alkass7"),
+    RadioStation("FoX FM Alkass 8", "http://foxfm.xyz:8080/alkass8")
+)
+
+// ---------------------------------------------------------------------------
+// 1. Delay Audio Processor
 // ---------------------------------------------------------------------------
 @OptIn(UnstableApi::class)
 class DelayAudioProcessor : BaseAudioProcessor() {
@@ -62,6 +91,7 @@ class DelayAudioProcessor : BaseAudioProcessor() {
 
     @Volatile var delaySeconds: Double = 0.0
     @Volatile var isMuted: Boolean = false
+    @Volatile var volumeBoost: Float = 1.0f
 
     private val envelopeQueue = ConcurrentLinkedQueue<Pair<Long, Float>>()
 
@@ -128,20 +158,24 @@ class DelayAudioProcessor : BaseAudioProcessor() {
         if (isMuted) {
             for (i in 0 until inputSamples.size) outShort.put(0)
         } else {
-            // Crossfade بسيط لتفادي "الفرقعة" عند تغيير التأخير
             val targetSamplesToDelay = (delaySeconds * sampleRate * channelCount).toInt()
             var targetReadPos = (writePos - targetSamplesToDelay) % maxBufferSamples
             if (targetReadPos < 0) targetReadPos += maxBufferSamples
             
             val diff = abs(readPos - targetReadPos)
-            val smoothingFactor = if (diff > 1000) 0.1f else 0.5f // تعديل ناعم
+            val smoothingFactor = if (diff > 1000) 0.1f else 0.5f
 
             var currentRead = readPos.toFloat()
             for (i in 0 until inputSamples.size) {
-                // اقتراب ناعم نحو نقطة القراءة المطلوبة
                 currentRead += (targetReadPos - currentRead) * smoothingFactor
                 val idx = (currentRead.toInt() + i) % maxBufferSamples
-                outShort.put(ringBuffer[if (idx < 0) idx + maxBufferSamples else idx])
+                val safeIdx = if (idx < 0) idx + maxBufferSamples else idx
+                
+                var boosted = (ringBuffer[safeIdx] * volumeBoost).toInt()
+                if (boosted > Short.MAX_VALUE) boosted = Short.MAX_VALUE.toInt()
+                if (boosted < Short.MIN_VALUE) boosted = Short.MIN_VALUE.toInt()
+                
+                outShort.put(boosted.toShort())
             }
         }
         outputBuffer.position(0)
@@ -153,7 +187,7 @@ class DelayAudioProcessor : BaseAudioProcessor() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. المشغل العام (Background Player Singleton)
+// 2. المشغل العام والخدمة الخلفية
 // ---------------------------------------------------------------------------
 @OptIn(UnstableApi::class)
 object PlayerManager {
@@ -163,10 +197,7 @@ object PlayerManager {
     var isPlaying = false
 }
 
-// ---------------------------------------------------------------------------
-// 3. Local TCP Relay (مع إعادة الاتصال التلقائي)
-// ---------------------------------------------------------------------------
-class LocalRelayServer(private val remoteUrl: String) {
+class LocalRelayServer(private val remoteUrl: String, private val onReconnecting: (Boolean) -> Unit) {
     private var serverSocket: ServerSocket? = null
     private var relayThread: Thread? = null
 
@@ -195,8 +226,10 @@ class LocalRelayServer(private val remoteUrl: String) {
     private fun handleClient(client: Socket) {
         var retries = 0
         try {
-            while (retries < 5 && !Thread.currentThread().isInterrupted) {
+            while (retries < 10 && !Thread.currentThread().isInterrupted) {
                 try {
+                    if (retries > 0) onReconnecting(true)
+                    
                     val remote = URL(remoteUrl).openConnection() as HttpURLConnection
                     remote.instanceFollowRedirects = true
                     remote.setRequestProperty("User-Agent", "VLC/3.0.18")
@@ -211,6 +244,9 @@ class LocalRelayServer(private val remoteUrl: String) {
                     val header = "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nConnection: close\r\n\r\n"
                     output.write(header.toByteArray())
                     output.flush()
+                    
+                    onReconnecting(false)
+                    retries = 0
 
                     val buffer = ByteArray(16 * 1024)
                     while (!Thread.currentThread().isInterrupted) {
@@ -219,20 +255,41 @@ class LocalRelayServer(private val remoteUrl: String) {
                         output.write(buffer, 0, read)
                         output.flush()
                     }
-                    break // نجح البث
+                    break 
                 } catch (e: Exception) {
                     retries++
-                    Thread.sleep(2000) // انتظار قبل المحاولة مجدداً
+                    onReconnecting(true)
+                    Thread.sleep(3000) 
                 }
             }
         } finally {
             try { client.close() } catch (_: IOException) { }
+            onReconnecting(false)
         }
     }
 }
 
+class RadioForegroundService : Service() {
+    override fun onBind(intent: Intent?): IBinder? = null
+    override fun onCreate() {
+        super.onCreate()
+        val channel = NotificationChannel("radio_channel", "Radio Sync", NotificationManager.IMPORTANCE_LOW)
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.createNotificationChannel(channel)
+    }
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val notification = NotificationCompat.Builder(this, "radio_channel")
+            .setContentTitle("Radio Sync يعمل")
+            .setContentText("البث قيد التشغيل في الخلفية...")
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .build()
+        startForeground(1, notification)
+        return START_NOT_STICKY
+    }
+}
+
 // ---------------------------------------------------------------------------
-// 4. Sync Engine (مع خوارزمية Onset للتركيز على أحداث المباراة)
+// 3. Sync Engine (مع فلترة الترددات Bandpass Filter)
 // ---------------------------------------------------------------------------
 object SyncEngine {
     data class Result(val delaySeconds: Double, val isSuccess: Boolean, val message: String)
@@ -260,7 +317,7 @@ object SyncEngine {
         val mic = computeOnsets(micRaw)
 
         if (radio.sumOf { it.second.toDouble() } < 1000.0 || mic.sumOf { it.second.toDouble() } < 1000.0) {
-            return Result(0.0, false, "لم نرصد أحداثاً قوية (أهداف أو صافرات). أعد المحاولة أثناء هجمة.")
+            return Result(0.0, false, "لم نرصد أحداثاً قوية. أعد المحاولة أثناء هجمة أو صافرة.")
         }
 
         val startTime = min(radio.first().first, mic.first().first)
@@ -278,10 +335,9 @@ object SyncEngine {
         var bestLagIdx = 0
         var bestCorr = -2.0
 
-        for (lag in -3000..12000) { // -30 ثانية (تلفاز متقدم) إلى +120 ثانية (راديو متقدم)
+        for (lag in -3000..12000) {
             val start = max(micStartIdx, lag)
             val end = min(micEndIdx, rArr.size + lag)
-
             if (start < end) {
                 val mSeg = mArr.copyOfRange(start, end)
                 val rSeg = rArr.copyOfRange(start - lag, end - lag)
@@ -315,36 +371,15 @@ object SyncEngine {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Foreground Service (للتشغيل في الخلفية)
-// ---------------------------------------------------------------------------
-class RadioForegroundService : Service() {
-    override fun onBind(intent: Intent?): IBinder? = null
-    override fun onCreate() {
-        super.onCreate()
-        val channel = NotificationChannel("radio_channel", "Radio Sync", NotificationManager.IMPORTANCE_LOW)
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        manager.createNotificationChannel(channel)
-    }
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val notification = NotificationCompat.Builder(this, "radio_channel")
-            .setContentTitle("Radio Sync يعمل")
-            .setContentText("جاري مزامنة البث الصوتي...")
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .build()
-        startForeground(1, notification)
-        return START_NOT_STICKY
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 6. MainActivity
+// 4. MainActivity (الواجهة النظيفة مع اختيار الإذاعة)
 // ---------------------------------------------------------------------------
 @OptIn(UnstableApi::class)
 class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var delayReadout: TextView
     private lateinit var confidenceBadge: TextView
-    private lateinit var urlInput: EditText
+    private lateinit var stationSpinner: Spinner
+    private lateinit var customUrlInput: EditText
     private lateinit var playButton: Button
     private lateinit var measureButton: Button
     private lateinit var countdownBar: ProgressBar
@@ -353,17 +388,19 @@ class MainActivity : AppCompatActivity() {
     private lateinit var resetButton: Button
     private lateinit var manualDelayReadout: TextView
     private lateinit var delaySlider: SeekBar
+    private lateinit var sleepTimerButton: Button
 
     private var measuredDelay: Double? = null
     private var selectedDurationSec = 20
     private var isMeasuring = false
+    private var sleepTimerRunnable: Runnable? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val prefs by lazy { getSharedPreferences("radio_sync", Context.MODE_PRIVATE) }
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     private val recordPermissionLauncher = registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) startMeasurement() else updateStatus("يجب السماح بالوصول إلى الميكروفون لقياس التأخير")
+        if (granted) startMeasurement() else updateStatus("يجب السماح بالوصول إلى الميكروفون لقياس التأخير", true)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -395,72 +432,94 @@ class MainActivity : AppCompatActivity() {
         val scroll = ScrollView(this)
         scroll.addView(root, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
 
+        // 1. بطاقة الحالة
         val statusCard = card()
         statusText = TextView(this).apply { text = "لم يتم الاتصال بعد"; setTextColor(Color.WHITE); textSize = 16f }
-        delayReadout = TextView(this).apply { text = "الصورة 0.0 ث • الصوت 0.00 ث"; setTextColor(Color.parseColor("#94A3B8")); textSize = 14f }
-        confidenceBadge = TextView(this).apply { visibility = View.GONE; setTextColor(Color.parseColor("#10B981")); textSize = 12f; setPadding(dp(8), dp(4), dp(8), dp(4)); background = roundedBg(Color.parseColor("#10B981"), 20) }
+        delayReadout = TextView(this).apply { text = "الصورة 0.0 ث • الصوت 0.00 ث"; setTextColor(Color.parseColor("#94A3B8")); textSize = 14f; setPadding(0, dp(4), 0, 0) }
+        confidenceBadge = TextView(this).apply { visibility = View.GONE; setTextColor(Color.parseColor("#10B981")); textSize = 12f; setPadding(dp(8), dp(4), dp(8), dp(4)); background = roundedBg(Color.parseColor("#10B981"), 20); layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) } }
         statusCard.addView(statusText); statusCard.addView(delayReadout); statusCard.addView(confidenceBadge)
         root.addView(statusCard)
 
+        // 2. بطاقة البث (قائمة الإذاعات)
         val streamCard = card()
-        urlInput = EditText(this).apply {
-            hint = "أدخل رابط البث"; setTextColor(Color.WHITE); setHintTextColor(Color.parseColor("#64748B"))
-            inputType = InputType.TYPE_TEXT_VARIATION_URI; setSingleLine(); setBackgroundColor(Color.parseColor("#1E293B")); setPadding(dp(12), dp(10), dp(12), dp(10))
+        
+        stationSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, foxFmStations.map { it.name }).apply {
+                setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            }
+            setBackgroundColor(Color.parseColor("#1E293B"))
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                    customUrlInput.setText(foxFmStations[position].url)
+                }
+                override fun onNothingSelected(parent: AdapterView<*>?) {}
+            }
         }
-        val lastUrl = prefs.getString("last_url", "http://foxfm.xyz:8080/live1") ?: "http://foxfm.xyz:8080/live1"
-        urlInput.setText(lastUrl)
+        streamCard.addView(stationSpinner)
+
+        customUrlInput = EditText(this).apply {
+            hint = "أو أدخل رابط بث مخصص هنا"; setTextColor(Color.WHITE); setHintTextColor(Color.parseColor("#64748B"))
+            inputType = InputType.TYPE_TEXT_VARIATION_URI; setSingleLine()
+            setBackgroundColor(Color.parseColor("#1E293B")); setPadding(dp(12), dp(10), dp(12), dp(10))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) }
+        }
+        
+        val lastUrl = prefs.getString("last_url", foxFmStations[0].url) ?: foxFmStations[0].url
+        customUrlInput.setText(lastUrl)
         
         playButton = emeraldButton("تشغيل") { togglePlay() }
         val streamRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        streamRow.addView(urlInput, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        streamRow.addView(playButton, LinearLayout.LayoutParams(dp(90), ViewGroup.LayoutParams.WRAP_CONTENT))
+        streamRow.addView(customUrlInput, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        streamRow.addView(playButton, LinearLayout.LayoutParams(dp(85), ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginStart = dp(8) })
         streamCard.addView(streamRow)
-        
-        // Quick URLs (أزرار حفظ الروابط السريعة)
-        val quickUrlsLayout = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(8), 0, 0) }
-        val btnSaveUrl = Button(this).apply {
-            text = "+ حفظ الرابط"; setTextColor(Color.WHITE); textSize = 12f; background = roundedBg(Color.parseColor("#334155"), 12)
-            setOnClickListener {
-                val url = urlInput.text.toString().trim()
-                if (url.isNotEmpty()) {
-                    val saved = prefs.getStringSet("saved_urls", mutableSetOf()) as MutableSet<String>
-                    saved.add(url); prefs.edit().putStringSet("saved_urls", saved).apply(); rebuildQuickUrls(quickUrlsLayout)
-                }
-            }
-        }
-        quickUrlsLayout.addView(btnSaveUrl)
-        streamCard.addView(quickUrlsLayout)
-        rebuildQuickUrls(quickUrlsLayout)
-        
         root.addView(streamCard)
 
+        // 3. بطاقة الفحص
         val measureCard = card()
         measureButton = emeraldButton("فحص التأخير") { requestMeasurement() }
         measureCard.addView(measureButton)
 
-        val durationGroup = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL; gravity = Gravity.CENTER }
-        for (sec in listOf(10, 15, 20, 30, 45, 60)) {
-            val rb = RadioButton(this).apply { text = "${sec} ث"; setTextColor(Color.WHITE); id = View.generateViewId(); tag = sec; isChecked = sec == 20 }
-            durationGroup.addView(rb)
+        val spinnerLayout = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, dp(12), 0, 0) }
+        spinnerLayout.addView(TextView(this).apply { text = "مدة الفحص: "; setTextColor(Color.WHITE); textSize = 14f })
+        
+        val durationSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, listOf("10 ثواني", "15 ثانية", "20 ثانية (افتراضي)", "30 ثانية", "45 ثانية", "60 ثانية")).apply {
+                setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            }
+            setSelection(2)
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                    selectedDurationSec = when(position) { 0->10; 1->15; 2->20; 3->30; 4->45; else->60 }
+                }
+                override fun onNothingSelected(parent: AdapterView<*>?) {}
+            }
         }
-        durationGroup.setOnCheckedChangeListener { _, checkedId -> selectedDurationSec = (findViewById<RadioButton>(checkedId)?.tag as? Int) ?: 20 }
-        measureCard.addView(durationGroup)
+        spinnerLayout.addView(durationSpinner, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        measureCard.addView(spinnerLayout)
 
-        countdownBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 100; progress = 0; visibility = View.GONE; progressTintList = android.content.res.ColorStateList.valueOf(Color.parseColor("#10B981")) }
-        measureCard.addView(countdownBar); root.addView(measureCard)
+        countdownBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { 
+            max = 100; progress = 0; visibility = View.GONE; 
+            progressTintList = android.content.res.ColorStateList.valueOf(Color.parseColor("#10B981"))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) }
+        }
+        measureCard.addView(countdownBar)
+        root.addView(measureCard)
 
+        // 4. أزرار التحكم
         val actionRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER; setPadding(0, dp(8), 0, dp(8)) }
         syncButton = emeraldButton("زامن الآن") { applyMeasuredDelay() }
         muteButton = emeraldButton("صوت القناة") { toggleMute() }
         resetButton = emeraldButton("إيقاف المزامنة") { resetDelay() }
-        actionRow.addView(syncButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        actionRow.addView(muteButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        actionRow.addView(syncButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(4) })
+        actionRow.addView(muteButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(4) })
         actionRow.addView(resetButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         root.addView(actionRow)
 
+        // 5. الضبط اليدوي
         val manualCard = card()
-        manualCard.addView(TextView(this).apply { text = "ضبط يدوي"; setTextColor(Color.WHITE); textSize = 18f; setPadding(0, 0, 0, dp(8)) })
-        manualDelayReadout = TextView(this).apply { text = "0.00 ث"; setTextColor(Color.parseColor("#10B981")); textSize = 32f; gravity = Gravity.CENTER }
+        manualCard.addView(TextView(this).apply { text = "ضبط يدوي ومضخم الصوت"; setTextColor(Color.WHITE); textSize = 18f; setPadding(0, 0, 0, dp(8)) })
+        
+        manualDelayReadout = TextView(this).apply { text = "0.00 ث"; setTextColor(Color.parseColor("#10B981")); textSize = 36f; gravity = Gravity.CENTER }
         manualCard.addView(manualDelayReadout)
 
         delaySlider = SeekBar(this).apply {
@@ -481,33 +540,75 @@ class MainActivity : AppCompatActivity() {
         })
         manualCard.addView(delaySlider)
 
-        val nudgeRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER; setPadding(0, dp(8), 0, 0) }
-        for (n in listOf(-10.0, -1.0, -0.25, 0.25, 1.0, 10.0)) {
+        val nudgeRow1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(8), 0, dp(4)) }
+        val nudgeRow2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, 0, 0, dp(8)) }
+        
+        val nudgeButtons = listOf(-10.0, -1.0, -0.25, 0.25, 1.0, 10.0)
+        for ((index, n) in nudgeButtons.withIndex()) {
             val btn = Button(this).apply {
-                text = if (n > 0) "+${n} ث" else "${n} ث"; setTextColor(Color.WHITE); textSize = 12f
-                background = roundedBg(Color.parseColor("#334155"), 20); setPadding(dp(8), dp(6), dp(8), dp(6))
+                text = if (n > 0) "+${n} ث" else "${n} ث"; setTextColor(Color.WHITE); textSize = 13f
+                background = roundedBg(Color.parseColor("#334155"), 12); 
                 setOnClickListener {
                     val newVal = ((delaySlider.progress / 100.0) + n).coerceIn(0.0, 120.0)
                     delaySlider.progress = (newVal * 100).toInt()
                 }
             }
-            nudgeRow.addView(btn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(4) })
+            val params = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) }
+            if (index < 3) nudgeRow1.addView(btn, params) else nudgeRow2.addView(btn, params)
         }
-        manualCard.addView(nudgeRow); root.addView(manualCard)
+        manualCard.addView(nudgeRow1); manualCard.addView(nudgeRow2)
+
+        manualCard.addView(TextView(this).apply { text = "مضخم الصوت (Volume Boost)"; setTextColor(Color.parseColor("#94A3B8")); textSize = 14f; setPadding(0, dp(8), 0, 0) })
+        val volSlider = SeekBar(this).apply {
+            max = 300; progress = 100
+            progressTintList = android.content.res.ColorStateList.valueOf(Color.parseColor("#F59E0B"))
+            thumbTintList = android.content.res.ColorStateList.valueOf(Color.parseColor("#F59E0B"))
+        }
+        volSlider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                PlayerManager.audioProcessor?.volumeBoost = progress / 100f
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        })
+        manualCard.addView(volSlider)
+        root.addView(manualCard)
+
+        // 6. مؤقت النوم
+        val sleepCard = card()
+        sleepTimerButton = Button(this).apply {
+            text = "مؤقت النوم: إيقاف"; setTextColor(Color.WHITE); textSize = 15f
+            background = roundedBg(Color.parseColor("#475569"), 12)
+            setOnClickListener { showSleepTimerDialog() }
+        }
+        sleepCard.addView(sleepTimerButton)
+        root.addView(sleepCard)
+
         setContentView(scroll)
     }
 
-    private fun rebuildQuickUrls(layout: LinearLayout) {
-        layout.removeViews(1, layout.childCount - 1)
-        val saved = prefs.getStringSet("saved_urls", mutableSetOf()) ?: mutableSetOf()
-        for (url in saved) {
-            val host = try { URL(url).host } catch (_: Exception) { url }
-            val btn = Button(this).apply {
-                text = host; setTextColor(Color.WHITE); textSize = 12f; background = roundedBg(Color.parseColor("#1E293B"), 12)
-                setPadding(dp(8), dp(6), dp(8), dp(6)); setOnClickListener { urlInput.setText(url) }
+    private fun showSleepTimerDialog() {
+        val options = arrayOf("إيقاف المؤقت", "15 دقيقة", "30 دقيقة", "45 دقيقة", "60 دقيقة")
+        AlertDialog.Builder(this)
+            .setTitle("مؤقت النوم")
+            .setItems(options) { _, which ->
+                sleepTimerRunnable?.let { mainHandler.removeCallbacks(it) }
+                if (which == 0) {
+                    sleepTimerButton.text = "مؤقت النوم: إيقاف"
+                } else {
+                    val minutes = when(which) { 1 -> 15; 2 -> 30; 3 -> 45; else -> 60 }
+                    val millis = minutes * 60 * 1000L
+                    sleepTimerButton.text = "مؤقت النوم: $minutes دقيقة"
+                    sleepTimerRunnable = Runnable {
+                        if (PlayerManager.isPlaying) togglePlay()
+                        sleepTimerButton.text = "مؤقت النوم: إيقاف"
+                        Toast.makeText(this, "تم إيقاف البث بواسطة مؤقت النوم", Toast.LENGTH_LONG).show()
+                    }
+                    mainHandler.postDelayed(sleepTimerRunnable!!, millis)
+                    Toast.makeText(this, "سيتم إيقاف البث بعد $minutes دقيقة", Toast.LENGTH_SHORT).show()
+                }
             }
-            layout.addView(btn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(4) })
-        }
+            .show()
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -516,10 +617,10 @@ class MainActivity : AppCompatActivity() {
         layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(12) }
     }
     private fun emeraldButton(text: String, onClick: () -> Unit): Button = Button(this).apply {
-        this.text = text; setTextColor(Color.WHITE); textSize = 15f; background = roundedBg(Color.parseColor("#10B981"), 12); setOnClickListener { onClick() }
+        this.text = text; setTextColor(Color.WHITE); textSize = 14f; background = roundedBg(Color.parseColor("#10B981"), 12); setOnClickListener { onClick() }
     }
     private fun roundedBg(color: Int, radiusDp: Int): GradientDrawable = GradientDrawable().apply { setColor(color); cornerRadius = dp(radiusDp).toFloat() }
-    private fun updateStatus(msg: String, isError: Boolean = false) { mainHandler.post { statusText.text = msg; statusText.setTextColor(if (isError) Color.parseColor("#EF4444") else Color.WHITE) } }
+    private fun updateStatus(msg: String, isError: Boolean = false) { mainHandler.post { statusText.text = msg; statusText.setTextColor(if (isError) Color.parseColor("#EF4444") else if (msg.contains("إعادة الاتصال")) Color.parseColor("#F59E0B") else Color.WHITE) } }
     private fun updateDelayReadout(tvDelay: Double, radioDelay: Double) { mainHandler.post { delayReadout.text = "الصورة %.1f ث • الصوت %.2f ث".format(tvDelay, radioDelay) } }
 
     private fun togglePlay() {
@@ -528,13 +629,17 @@ class MainActivity : AppCompatActivity() {
             PlayerManager.relayServer?.stop(); PlayerManager.relayServer = null; PlayerManager.isPlaying = false
             playButton.text = "تشغيل"; updateStatus("تم إيقاف البث")
             stopService(Intent(this, RadioForegroundService::class.java))
+            sleepTimerRunnable?.let { mainHandler.removeCallbacks(it); sleepTimerButton.text = "مؤقت النوم: إيقاف" }
         } else {
-            val url = urlInput.text.toString().trim()
+            val url = customUrlInput.text.toString().trim()
             if (url.isEmpty()) { updateStatus("الرجاء إدخال رابط البث", true); return }
             prefs.edit().putString("last_url", url).apply()
 
             val playbackUrl = if (url.contains(".m3u8", ignoreCase = true)) url else {
-                PlayerManager.relayServer = LocalRelayServer(url)
+                PlayerManager.relayServer = LocalRelayServer(url) { isReconnecting ->
+                    if (isReconnecting) updateStatus("جاري إعادة الاتصال بالبث...")
+                    else updateStatus("البث يعمل الآن")
+                }
                 "http://127.0.0.1:${PlayerManager.relayServer!!.start()}/stream"
             }
 
@@ -602,11 +707,23 @@ class MainActivity : AppCompatActivity() {
                 recorder.startRecording(); val buffer = ShortArray(1600); val startNano = System.nanoTime()
                 var elapsedMs = 0L; val totalMs = selectedDurationSec * 1000L
 
+                // متغيرات فلتر التردد العالي (High-Pass Filter)
+                var prevInput = 0.0
+                var prevOutput = 0.0
+                val alpha = 0.9 // يحذف الترددات المنخفضة (هدير الجمهور) ويركز على الصافرات
+
                 while (elapsedMs < totalMs && isActive) {
                     val read = recorder.read(buffer, 0, buffer.size)
                     if (read > 0) {
                         var sum = 0.0
-                        for (i in 0 until read) sum += buffer[i].toDouble() * buffer[i]
+                        for (i in 0 until read) {
+                            val raw = buffer[i].toDouble()
+                            // تطبيق الفلتر
+                            val filtered = alpha * (prevOutput + raw - prevInput)
+                            prevInput = raw
+                            prevOutput = filtered
+                            sum += filtered * filtered
+                        }
                         micEnvelope.add(System.nanoTime() to sqrt(sum / read).toFloat())
                     }
                     elapsedMs = (System.nanoTime() - startNano) / 1_000_000
@@ -645,9 +762,5 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         scope.cancel()
-        // لا نقوم بإغلاق المشغل هنا لكي يستمر في الخلفية (Foreground Service)
-        if (!isFinishing) {
-            // إذا تم إغلاق الواجهة فقط، نتركه يعمل
-        }
     }
 }
